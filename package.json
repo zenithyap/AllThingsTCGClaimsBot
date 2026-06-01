@@ -1,7 +1,9 @@
 {
   "dependencies": {
+    "@supabase/supabase-js": "^2.106.2",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "prettier": "^3.8.3",
     "supabase": "^2.102.0",
     "telegraf": "^4.16.3"
   },
