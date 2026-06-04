@@ -1,4 +1,4 @@
-import { Telegraf } from 'telegraf'
+import { Telegraf, Markup } from 'telegraf'
 import { createClient } from '@supabase/supabase-js'
 import * as dotenv from 'dotenv'
 dotenv.config()
@@ -6,11 +6,13 @@ dotenv.config()
 const bot = new Telegraf(process.env.BOT_TOKEN)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY)
 
-const CHANNEL_ID = process.env.CHANNEL_ID   // e.g. -1001234567890
-const ADMIN_IDS  = (process.env.ADMIN_IDS ?? '').split(',').map(Number)
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME // e.g. @yourusername — for collection/delivery contact
+const CHANNEL_ID          = process.env.CHANNEL_ID
+const ADMIN_IDS           = (process.env.ADMIN_IDS ?? '').split(',').map(Number)
+const ADMIN_USERNAME      = process.env.ADMIN_USERNAME
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+const pendingAddress = new Map()
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function isAdmin(userId) {
   return ADMIN_IDS.includes(userId)
@@ -19,10 +21,10 @@ function isAdmin(userId) {
 async function upsertUser(from) {
   await supabase.from('users').upsert({
     telegram_user_id: from.id,
-    username:   from.username   ?? null,
-    first_name: from.first_name ?? null,
-    last_name:  from.last_name  ?? null,
-    last_active_at: new Date().toISOString(),
+    username:         from.username   ?? null,
+    first_name:       from.first_name ?? null,
+    last_name:        from.last_name  ?? null,
+    last_active_at:   new Date().toISOString(),
   }, { onConflict: 'telegram_user_id' })
 }
 
@@ -37,6 +39,23 @@ async function getCardByThread(ctx) {
     .single()
 
   return data ?? null
+}
+
+function buildInvoiceSummary(claims) {
+  // Group claims by card name + price
+  const grouped = {}
+  for (const c of claims) {
+    const key = c.cards.id
+    if (!grouped[key]) {
+      grouped[key] = { name: c.cards.name, price: Number(c.cards.price), qty: 0 }
+    }
+    grouped[key].qty++
+  }
+  const lines = Object.values(grouped).map((c, i) =>
+    `${i + 1}. <b>${c.name}</b> x${c.qty} — $${(c.price * c.qty).toFixed(2)}`
+  ).join('\n')
+  const total = claims.reduce((sum, c) => sum + Number(c.cards.price), 0)
+  return { lines, total }
 }
 
 // ─── /postcards ──────────────────────────────────────────────────────────────
@@ -71,14 +90,13 @@ bot.command('postcards', async (ctx) => {
     try {
       const category = card.category_name ?? card.categories?.name ?? 'Uncategorised'
       const caption =
-        `🃏 *${card.name}*\n` +
+        `🃏 <b>${card.name}</b>\n` +
         `📂 ${category}\n` +
-        `💰 *$${Number(card.price).toFixed(2)}*\n` +
+        `💰 <b>$${Number(card.price).toFixed(2)}</b>\n` +
         `📦 Stock: ${card.quantity}\n\n` +
-        `💬 Comment *claim* to grab this card!\n` +
-        `↩️ Comment *unclaim* to release it.`
+        `💬 Comment <b>claim</b> or <b>claim 2</b> to grab this card!\n` +
+        `↩️ Comment <b>unclaim</b> or <b>unclaim 2</b> to release.`
 
-      // Delete old channel post if exists
       const { data: existingPost } = await supabase
         .from('discussion_posts')
         .select('telegram_message_id')
@@ -98,17 +116,17 @@ bot.command('postcards', async (ctx) => {
 
       if (card.front_image_url && card.back_image_url) {
         const mediaGroup = await ctx.telegram.sendMediaGroup(CHANNEL_ID, [
-          { type: 'photo', media: card.front_image_url, caption, parse_mode: 'Markdown' },
+          { type: 'photo', media: card.front_image_url, caption, parse_mode: 'HTML' },
           { type: 'photo', media: card.back_image_url },
         ])
         sentMessage = mediaGroup[0]
       } else if (card.front_image_url) {
         sentMessage = await ctx.telegram.sendPhoto(CHANNEL_ID, card.front_image_url, {
-          caption, parse_mode: 'Markdown',
+          caption, parse_mode: 'HTML',
         })
       } else {
         sentMessage = await ctx.telegram.sendMessage(CHANNEL_ID, caption, {
-          parse_mode: 'Markdown',
+          parse_mode: 'HTML',
         })
       }
 
@@ -129,13 +147,22 @@ bot.command('postcards', async (ctx) => {
   ctx.reply(`✅ Done! Posted: ${posted} card(s)` + (failed ? ` | ❌ Failed: ${failed}` : ''))
 })
 
-// ─── Claim ───────────────────────────────────────────────────────────────────
+// ─── Claim ────────────────────────────────────────────────────────────────────
+// Matches: "claim", "claim 2", "claim 10", etc.
 
-bot.hears(/^claim$/i, async (ctx) => {
+bot.hears(/^claim(\s+\d+)?$/i, async (ctx) => {
   if (!ctx.message?.message_thread_id) return
 
   const chatId = ctx.message.chat.id
   const replyTo = { reply_parameters: { message_id: ctx.message.message_id } }
+
+  // Parse quantity from message — default 1
+  const match = ctx.message.text.trim().match(/^claim\s+(\d+)$/i)
+  const requestedQty = match ? parseInt(match[1], 10) : 1
+
+  if (requestedQty < 1) {
+    return ctx.telegram.sendMessage(chatId, `❌ Quantity must be at least 1.`, replyTo)
+  }
 
   await upsertUser(ctx.from)
 
@@ -150,46 +177,67 @@ bot.hears(/^claim$/i, async (ctx) => {
     return ctx.telegram.sendMessage(chatId, `❌ This card is no longer available.`, replyTo)
   }
 
-  const { count: claimCount } = await supabase
+  // Count total active claims for this card
+  const { count: totalClaimed } = await supabase
     .from('claims')
     .select('id', { count: 'exact', head: true })
     .eq('card_id', card.id)
 
-  const { data: myExistingClaim } = await supabase
+  // Count how many this specific user has already claimed
+  const { count: userClaimed } = await supabase
     .from('claims')
-    .select('id')
+    .select('id', { count: 'exact', head: true })
     .eq('card_id', card.id)
     .eq('telegram_user_id', userId)
-    .single()
 
-  if (myExistingClaim) {
-    return ctx.telegram.sendMessage(chatId, `ℹ️ You already have *${card.name}* claimed.`, { parse_mode: 'Markdown', ...replyTo })
+  const available = card.quantity - totalClaimed
+
+  if (available <= 0) {
+    return ctx.telegram.sendMessage(chatId, `❌ Sorry, all <b>${card.name}</b> have been claimed.`, { parse_mode: 'HTML', ...replyTo })
   }
 
-  if (claimCount >= card.quantity) {
-    return ctx.telegram.sendMessage(chatId, `❌ Sorry, all *${card.name}* have been claimed.`, { parse_mode: 'Markdown', ...replyTo })
+  if (requestedQty > available) {
+    return ctx.telegram.sendMessage(chatId,
+      `❌ Only <b>${available}</b> of <b>${card.name}</b> left. You can claim at most ${available}.`,
+      { parse_mode: 'HTML', ...replyTo }
+    )
   }
 
-  const { error } = await supabase.from('claims').insert({
+  // Insert one row per unit claimed (keeps unclaim-by-quantity logic simple)
+  const rows = Array.from({ length: requestedQty }, () => ({
     card_id:          card.id,
     telegram_user_id: userId,
-  })
+  }))
 
+  const { error } = await supabase.from('claims').insert(rows)
   if (error) return ctx.telegram.sendMessage(chatId, `❌ Could not save claim. Try again.`, replyTo)
 
-  const remaining = card.quantity - claimCount - 1
-  const remainingMsg = remaining > 0 ? `\n📦 ${remaining} left!` : `\n📦 Last one taken!`
+  const remaining = available - requestedQty
+  const remainingMsg = remaining > 0 ? `\n📦 ${remaining} left!` : `\n📦 Last one(s) taken!`
+  const qtyMsg = requestedQty > 1 ? ` x${requestedQty}` : ''
 
-  ctx.telegram.sendMessage(chatId, `✅ *${card.name}* claimed by ${name}! 🎉${remainingMsg}\nType /invoice in DM to see your cart.`, { parse_mode: 'Markdown', ...replyTo })
+  ctx.telegram.sendMessage(chatId,
+    `✅ <b>${card.name}</b>${qtyMsg} claimed by ${name}! 🎉${remainingMsg}\nType /invoice in DM to see your cart.`,
+    { parse_mode: 'HTML', ...replyTo }
+  )
 })
 
-// ─── Unclaim ─────────────────────────────────────────────────────────────────
+// ─── Unclaim ──────────────────────────────────────────────────────────────────
+// Matches: "unclaim", "unclaim 2", "unclaim 10", etc.
 
-bot.hears(/^unclaim$/i, async (ctx) => {
+bot.hears(/^unclaim(\s+\d+)?$/i, async (ctx) => {
   if (!ctx.message?.message_thread_id) return
 
   const chatId = ctx.message.chat.id
   const replyTo = { reply_parameters: { message_id: ctx.message.message_id } }
+
+  // Parse quantity — default 1
+  const match = ctx.message.text.trim().match(/^unclaim\s+(\d+)$/i)
+  const requestedQty = match ? parseInt(match[1], 10) : 1
+
+  if (requestedQty < 1) {
+    return ctx.telegram.sendMessage(chatId, `❌ Quantity must be at least 1.`, replyTo)
+  }
 
   const post = await getCardByThread(ctx)
   if (!post) return
@@ -197,23 +245,34 @@ bot.hears(/^unclaim$/i, async (ctx) => {
   const { cards: card } = post
   const userId = ctx.from.id
 
-  const { data: claim } = await supabase
+  // Fetch user's claims for this card, oldest first
+  const { data: userClaims } = await supabase
     .from('claims')
-    .select('id, telegram_user_id')
+    .select('id')
     .eq('card_id', card.id)
     .eq('telegram_user_id', userId)
-    .single()
+    .order('created_at', { ascending: true })
 
-  if (!claim) {
-    return ctx.telegram.sendMessage(chatId, `ℹ️ You haven't claimed *${card.name}*.`, { parse_mode: 'Markdown', ...replyTo })
+  if (!userClaims?.length) {
+    return ctx.telegram.sendMessage(chatId, `ℹ️ You haven't claimed <b>${card.name}</b>.`, { parse_mode: 'HTML', ...replyTo })
   }
 
-  await supabase.from('claims').delete().eq('id', claim.id)
+  if (requestedQty > userClaims.length) {
+    return ctx.telegram.sendMessage(chatId,
+      `❌ You only have <b>${userClaims.length}</b> claim(s) on <b>${card.name}</b>. You can unclaim at most ${userClaims.length}.`,
+      { parse_mode: 'HTML', ...replyTo }
+    )
+  }
 
-  ctx.telegram.sendMessage(chatId, `↩️ Claim on *${card.name}* removed.`, { parse_mode: 'Markdown', ...replyTo })
+  // Delete the oldest N claims
+  const idsToDelete = userClaims.slice(0, requestedQty).map(c => c.id)
+  await supabase.from('claims').delete().in('id', idsToDelete)
+
+  const qtyMsg = requestedQty > 1 ? ` x${requestedQty}` : ''
+  ctx.telegram.sendMessage(chatId, `↩️ Claim on <b>${card.name}</b>${qtyMsg} removed.`, { parse_mode: 'HTML', ...replyTo })
 })
 
-// ─── /release ────────────────────────────────────────────────────────────────
+// ─── /release ─────────────────────────────────────────────────────────────────
 
 bot.command('release', async (ctx) => {
   await upsertUser(ctx.from)
@@ -230,10 +289,10 @@ bot.command('release', async (ctx) => {
   await supabase.from('claims').delete().eq('telegram_user_id', userId)
 
   const cardNames = claims.map(c => `• ${c.cards.name}`).join('\n')
-  ctx.reply(`↩️ Released all your claims:\n\n${cardNames}`, { parse_mode: 'Markdown' })
+  ctx.reply(`↩️ Released all your claims:\n\n${cardNames}`, { parse_mode: 'HTML' })
 })
 
-// ─── /invoice ────────────────────────────────────────────────────────────────
+// ─── /invoice ─────────────────────────────────────────────────────────────────
 
 bot.command('invoice', async (ctx) => {
   await upsertUser(ctx.from)
@@ -248,87 +307,226 @@ bot.command('invoice', async (ctx) => {
 
   if (!claims?.length) {
     return ctx.telegram.sendMessage(userId,
-      "🛒 You haven't claimed any cards yet.\n\nComment *claim* under a card listing to grab one.",
-      { parse_mode: 'Markdown' }
+      "🛒 You haven't claimed any cards yet.\n\nComment <b>claim</b> under a card listing to grab one.",
+      { parse_mode: 'HTML' }
     )
   }
 
-  const total = claims.reduce((sum, c) => sum + Number(c.cards.price), 0)
-  const lines = claims.map((c, i) =>
-    `${i + 1}. *${c.cards.name}* — $${Number(c.cards.price).toFixed(2)}`
-  ).join('\n')
+  const { lines, total } = buildInvoiceSummary(claims)
 
   const msg =
-    `🧾 *Your Invoice*\n\n` +
+    `🧾 <b>Your Invoice</b>\n\n` +
     `${lines}\n\n` +
     `━━━━━━━━━━━━━━\n` +
-    `*Total: $${total.toFixed(2)}*\n\n` +
-    `📸 To pay, send your payment screenshot directly to this bot and we'll verify it shortly.`
+    `<b>Total: $${total.toFixed(2)}</b>\n\n` +
+    `Paynow to UEN <code>T26LL0533A</code> with your telegram username in the reference! Send your payment screenshot directly to this bot and we'll verify it shortly.`
 
-  await ctx.telegram.sendMessage(userId, msg, { parse_mode: 'Markdown' })
+  await ctx.telegram.sendMessage(userId, msg, { parse_mode: 'HTML' })
 
   if (ctx.chat.type !== 'private') {
     ctx.reply(`📩 Invoice sent to your DM, ${ctx.from.first_name}!`)
   }
 })
 
-// ─── Payment screenshot handler ──────────────────────────────────────────────
-// User sends a photo to the bot in DM → forwarded to all admins with user info + invoice
+// ─── Helper: show collection method menu ─────────────────────────────────────
 
-bot.on('photo', async (ctx) => {
-  // Only handle photos sent in private DM
-  if (ctx.chat.type !== 'private') return
+async function showCollectionMenu(ctx) {
+  return ctx.reply(
+    `Please select your preferred collection method:`,
+    {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('📦 Self Collect', 'collect_self')],
+        [Markup.button.callback('🛍️ TikTok Polymailer', 'collect_tiktok')],
+        [Markup.button.callback('📮 SingPost Polymailer (+$4)', 'collect_singpost')],
+      ])
+    }
+  )
+}
 
-  await upsertUser(ctx.from)
+// ─── Collection method: Self Collect ─────────────────────────────────────────
+
+bot.action('collect_self', async (ctx) => {
+  await ctx.answerCbQuery()
+  await ctx.editMessageReplyMarkup(undefined)
+  ctx.reply(
+    `Please confirm your option for Self Collection ⚠️\n\n` +
+    `Do follow the instructions and arrange for self collection inside here ⬇️\n` +
+    `https://t.me/allthingstcg/3946`,
+    {
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Confirm', 'confirm_self')],
+        [Markup.button.callback('↩️ Go Back', 'go_back')],
+      ])
+    }
+  )
+})
+
+bot.action('confirm_self', async (ctx) => {
+  await ctx.answerCbQuery()
   const userId = ctx.from.id
-  const name = ctx.from.first_name ?? ctx.from.username ?? 'User'
-  const username = ctx.from.username ? `@${ctx.from.username}` : `ID: ${userId}`
+  await notifyAdmins(ctx, userId, 'self_collect', 0)
+  await ctx.editMessageReplyMarkup(undefined)
+  ctx.reply(`Your collection method has been confirmed! ✅\n\n<i>PM @allthingstcgadmin for any further inquiries</i> 💬\n\n<b>Thank you for your support!</b> 🙇🏻‍♂️`, { parse_mode: 'HTML' })
+})
 
-  // Fetch their current claims
+// ─── Collection method: TikTok Polymailer ────────────────────────────────────
+
+bot.action('collect_tiktok', async (ctx) => {
+  await ctx.answerCbQuery()
+  await ctx.editMessageReplyMarkup(undefined)
+  ctx.reply(
+    `Please confirm your option for Tiktok Polymailer ⚠️\n\n` +
+    `Order the Tiktok Polymailer under "Re:Born" below and the items will be shipped to your registered address in Tiktok! ⬇️\n` +
+    `https://vt.tiktok.com/ZS92aPRb2F33S-clqGk/\n\n` +
+    `PM @allthingstcgadmin if the link does not work! ⛓️‍💥`,
+    {
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Confirm', 'confirm_tiktok')],
+        [Markup.button.callback('↩️ Go Back', 'go_back')],
+      ])
+    }
+  )
+})
+
+bot.action('confirm_tiktok', async (ctx) => {
+  await ctx.answerCbQuery()
+  const userId = ctx.from.id
+  await notifyAdmins(ctx, userId, 'tiktok_polymailer', 0)
+  await ctx.editMessageReplyMarkup(undefined)
+  ctx.reply(`Your collection method has been confirmed! ✅\n\n<i>PM @allthingstcgadmin for any further inquiries</i> 💬\n\n<b>Thank you for your support!</b> 🙇🏻‍♂️`, { parse_mode: 'HTML' })
+})
+
+// ─── Collection method: SingPost Polymailer ──────────────────────────────────
+
+bot.action('collect_singpost', async (ctx) => {
+  await ctx.answerCbQuery()
+  await ctx.editMessageReplyMarkup(undefined)
+  ctx.reply(
+    `Please confirm your option for Singpost Polymailer ⚠️\n\n` +
+    `Do paynow $4 to UEN <code>T26LL0533A</code> with your telegram username in the reference!`,
+    {
+      parse_mode: 'HTML',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Confirm', 'confirm_singpost')],
+        [Markup.button.callback('↩️ Go Back', 'go_back')],
+      ])
+    }
+  )
+})
+
+bot.action('confirm_singpost', async (ctx) => {
+  await ctx.answerCbQuery()
+  const userId = ctx.from.id
+  await ctx.editMessageReplyMarkup(undefined)
+  ctx.reply(
+    `📮 <b>SingPost Polymailer (+$4)</b>\n\n` +
+    `Please send your payment screenshot here and I'll collect your delivery details.`,
+    { parse_mode: 'HTML' }
+  )
+  pendingAddress.set(userId, { step: 'awaiting_shipping_screenshot' })
+})
+
+// ─── Go Back ──────────────────────────────────────────────────────────────────
+
+bot.action('go_back', async (ctx) => {
+  await ctx.answerCbQuery()
+  await ctx.editMessageReplyMarkup(undefined)
+  await showCollectionMenu(ctx)
+})
+
+// ─── notifyAdmins ─────────────────────────────────────────────────────────────
+
+async function notifyAdmins(ctx, userId, collectionMethod, shippingFee, shippingDetails = null) {
   const { data: claims } = await supabase
     .from('claims')
     .select('cards(name, price)')
     .eq('telegram_user_id', userId)
 
-  if (!claims?.length) {
-    return ctx.reply("⚠️ You don't have any active claims. Please comment *claim* on a card first before sending payment.", { parse_mode: 'Markdown' })
+  const { data: user } = await supabase
+    .from('users')
+    .select('first_name, username, pending_screenshot')
+    .eq('telegram_user_id', userId)
+    .single()
+
+  const name = user?.first_name ?? 'Unknown'
+  const username = user?.username ? `@${user.username}` : `ID: ${userId}`
+  const photoFileId = user?.pending_screenshot
+
+  const itemTotal = (claims ?? []).reduce((sum, c) => sum + Number(c.cards.price), 0)
+  const grandTotal = itemTotal + shippingFee
+
+  // Group items for admin caption
+  const grouped = {}
+  for (const c of (claims ?? [])) {
+    const key = c.cards.name
+    if (!grouped[key]) grouped[key] = { price: Number(c.cards.price), qty: 0 }
+    grouped[key].qty++
+  }
+  const itemList = Object.entries(grouped)
+    .map(([name, v]) => `• ${name} x${v.qty} — $${(v.price * v.qty).toFixed(2)}`)
+    .join('\n')
+
+  const methodLabel = {
+    self_collect:      '📦 Self Collect',
+    tiktok_polymailer: '🛍️ TikTok Polymailer',
+    singpost_mailing:  '📮 SingPost Polymailer',
+  }[collectionMethod] ?? collectionMethod
+
+  const updatePayload = {
+    pending_collection_method: collectionMethod,
+    pending_shipping_fee:      shippingFee,
+    pending_screenshot:        null,
+  }
+  if (shippingDetails) {
+    updatePayload.pending_recipient_name    = shippingDetails.name
+    updatePayload.pending_recipient_contact = shippingDetails.contact
+    updatePayload.pending_recipient_address = shippingDetails.address
+    updatePayload.pending_recipient_postal  = shippingDetails.postal
+  }
+  await supabase.from('users').update(updatePayload).eq('telegram_user_id', userId)
+
+  let adminCaption =
+    `💳 <b>Payment Received</b>\n\n` +
+    `👤 <b>User:</b> ${name} (${username})\n` +
+    `🆔 <b>User ID:</b> <code>${userId}</code>\n\n` +
+    `🛒 <b>Items:</b>\n${itemList}\n\n` +
+    `🚚 <b>Collection:</b> ${methodLabel}\n`
+
+  if (shippingFee > 0) adminCaption += `📦 <b>Shipping Fee:</b> $${shippingFee.toFixed(2)}\n`
+
+  adminCaption += `\n━━━━━━━━━━━━━━\n<b>Grand Total: $${grandTotal.toFixed(2)}</b>`
+
+  if (shippingDetails) {
+    adminCaption +=
+      `\n\n📋 <b>Delivery Details:</b>\n` +
+      `Name: ${shippingDetails.name}\n` +
+      `Contact: ${shippingDetails.contact}\n` +
+      `Address: ${shippingDetails.address}\n` +
+      `Postal: ${shippingDetails.postal}`
   }
 
-  const total = claims.reduce((sum, c) => sum + Number(c.cards.price), 0)
-  const itemList = claims.map(c => `• ${c.cards.name} — $${Number(c.cards.price).toFixed(2)}`).join('\n')
-
-  const adminCaption =
-    `💳 *Payment Screenshot Received*\n\n` +
-    `👤 *User:* ${name} (${username})\n` +
-    `🆔 *User ID:* \`${userId}\`\n\n` +
-    `🛒 *Claimed Cards:*\n${itemList}\n\n` +
-    `━━━━━━━━━━━━━━\n` +
-    `*Total: $${total.toFixed(2)}*\n\n` +
-    `To confirm payment, use:\n\`/markpaid ${userId}\``
-
-  // Forward the screenshot + invoice summary to every admin
-  const photo = ctx.message.photo.at(-1).file_id  // highest resolution
+  adminCaption += `\n\nTo confirm payment:\n<code>/markpaid ${userId}</code>`
 
   for (const adminId of ADMIN_IDS) {
     try {
-      await ctx.telegram.sendPhoto(adminId, photo, {
-        caption: adminCaption,
-        parse_mode: 'Markdown',
-      })
+      if (photoFileId) {
+        await ctx.telegram.sendPhoto(adminId, photoFileId, { caption: adminCaption, parse_mode: 'HTML' })
+      } else {
+        await ctx.telegram.sendMessage(adminId, adminCaption, { parse_mode: 'HTML' })
+      }
+      if (shippingDetails?.shippingScreenshot) {
+        await ctx.telegram.sendPhoto(adminId, shippingDetails.shippingScreenshot, {
+          caption: `📮 Shipping payment screenshot for ${username}`,
+        })
+      }
     } catch (e) {
       console.log(`Could not notify admin ${adminId}:`, e.message)
     }
   }
+}
 
-  // Acknowledge to the user
-  ctx.reply(
-    `✅ Payment screenshot received! We'll verify and confirm your order shortly.\n\n` +
-    `If you have any questions, feel free to reach out to ${ADMIN_USERNAME ?? 'the seller'}.`,
-    { parse_mode: 'Markdown' }
-  )
-})
-
-// ─── /markpaid ───────────────────────────────────────────────────────────────
+// ─── /markpaid ────────────────────────────────────────────────────────────────
 
 bot.command('markpaid', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('⛔ Admins only.')
@@ -343,23 +541,36 @@ bot.command('markpaid', async (ctx) => {
 
   if (!claims?.length) return ctx.reply(`No active claims found for user ${targetId}.`)
 
-  const total = claims.reduce((sum, c) => sum + Number(c.cards.price), 0)
+  const { data: user } = await supabase
+    .from('users')
+    .select('first_name, pending_collection_method, pending_shipping_fee, pending_recipient_name, pending_recipient_contact, pending_recipient_address, pending_recipient_postal')
+    .eq('telegram_user_id', targetId)
+    .single()
 
-  // Create order
+  const collectionMethod = user?.pending_collection_method ?? 'unknown'
+  const shippingFee      = Number(user?.pending_shipping_fee ?? 0)
+  const itemTotal        = claims.reduce((sum, c) => sum + Number(c.cards.price), 0)
+  const grandTotal       = itemTotal + shippingFee
+
   const { data: order, error: orderError } = await supabase
     .from('orders')
     .insert({
-      telegram_user_id: targetId,
-      status:           'paid',
-      total_amount:     total,
-      paid_at:          new Date().toISOString(),
+      telegram_user_id:  targetId,
+      status:            'paid',
+      total_amount:      grandTotal,
+      shipping_fee:      shippingFee,
+      collection_method: collectionMethod,
+      recipient_name:    user?.pending_recipient_name    ?? null,
+      recipient_contact: user?.pending_recipient_contact ?? null,
+      recipient_address: user?.pending_recipient_address ?? null,
+      recipient_postal:  user?.pending_recipient_postal  ?? null,
+      paid_at:           new Date().toISOString(),
     })
     .select()
     .single()
 
   if (orderError) return ctx.reply(`❌ Error creating order: ${orderError.message}`)
 
-  // Insert order items and reduce stock
   for (const claim of claims) {
     await supabase.from('order_items').insert({
       order_id:   order.id,
@@ -370,27 +581,50 @@ bot.command('markpaid', async (ctx) => {
     await supabase.rpc('decrement_quantity', { card_id: claim.cards.id })
   }
 
-  // Clear claims
   await supabase.from('claims').delete().eq('telegram_user_id', targetId)
 
-  // Notify the buyer
-  const itemList = claims.map(c => `• ${c.cards.name} — $${Number(c.cards.price).toFixed(2)}`).join('\n')
+  await supabase.from('users').update({
+    pending_collection_method:  null,
+    pending_shipping_fee:       null,
+    pending_recipient_name:     null,
+    pending_recipient_contact:  null,
+    pending_recipient_address:  null,
+    pending_recipient_postal:   null,
+  }).eq('telegram_user_id', targetId)
 
-  await ctx.telegram.sendMessage(
-    targetId,
-    `✅ *Payment Confirmed! Thank you!*\n\n` +
-    `*Order ID:* \`${order.id}\`\n\n` +
-    `🛒 *Items:*\n${itemList}\n\n` +
-    `━━━━━━━━━━━━━━\n` +
-    `*Total Paid: $${total.toFixed(2)}*\n\n` +
-    `📦 Please message ${ADMIN_USERNAME ?? 'the seller'} to arrange *self collection or delivery*. Thank you for your purchase! 🎉`,
-    { parse_mode: 'Markdown' }
-  )
+  // Group items for confirmation message
+  const grouped = {}
+  for (const c of claims) {
+    const key = c.cards.name
+    if (!grouped[key]) grouped[key] = { price: Number(c.cards.price), qty: 0 }
+    grouped[key].qty++
+  }
+  const itemList = Object.entries(grouped)
+    .map(([name, v]) => `• ${name} x${v.qty} — $${(v.price * v.qty).toFixed(2)}`)
+    .join('\n')
 
-  ctx.reply(`✅ Order confirmed. User notified. Order ID: \`${order.id}\``, { parse_mode: 'Markdown' })
+  const methodLabel = {
+    self_collect:      '📦 Self Collect',
+    tiktok_polymailer: '🛍️ TikTok Polymailer',
+    singpost_mailing:  '📮 SingPost Polymailer',
+  }[collectionMethod] ?? collectionMethod
+
+  let confirmMsg =
+    `✅ <b>Payment Confirmed! Thank you!</b>\n\n` +
+    `<b>Order ID:</b> <code>${order.id}</code>\n\n` +
+    `🛒 <b>Items:</b>\n${itemList}\n`
+
+  if (shippingFee > 0) confirmMsg += `📦 <b>Shipping:</b> $${shippingFee.toFixed(2)}\n`
+
+  confirmMsg += `\n━━━━━━━━━━━━━━\n<b>Total Paid: $${grandTotal.toFixed(2)}</b>\n\n🚚 <b>Collection Method:</b> ${methodLabel}\n\n`
+
+  confirmMsg += `Your collection method has been confirmed! ✅\n\n<i>PM @allthingstcgadmin for any further inquiries</i> 💬\n\n<b>Thank you for your support!</b> 🙇🏻‍♂️`
+
+  await ctx.telegram.sendMessage(targetId, confirmMsg, { parse_mode: 'HTML' })
+  ctx.reply(`✅ Order confirmed. User notified. Order ID: <code>${order.id}</code>`, { parse_mode: 'HTML' })
 })
 
-// ─── /claims (admin) ─────────────────────────────────────────────────────────
+// ─── /claims (admin) ──────────────────────────────────────────────────────────
 
 bot.command('claims', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('⛔ Admins only.')
@@ -403,43 +637,133 @@ bot.command('claims', async (ctx) => {
   if (error) return ctx.reply(`❌ ${error.message}`)
   if (!data?.length) return ctx.reply('No active claims.')
 
-  const lines = data.map(c => {
-    const user = c.users?.username ? `@${c.users.username}` : c.users?.first_name ?? c.telegram_user_id
-    return `• *${c.cards.name}* ($${Number(c.cards.price).toFixed(2)}) → ${user}`
-  }).join('\n')
-
-  ctx.reply(`📋 *Active Claims*\n\n${lines}`, { parse_mode: 'Markdown' })
-})
-
-// ─── Forward listener: update group thread ID after channel post is forwarded ─
-
-bot.on('message', async (ctx) => {
-  const fwd = ctx.message?.forward_from_chat
-  if (!fwd || fwd.id.toString() !== CHANNEL_ID.toString()) return
-
-  const originalChannelMessageId = ctx.message?.forward_from_message_id
-  const groupThreadMessageId = ctx.message?.message_id
-
-  if (!originalChannelMessageId || !groupThreadMessageId) return
-
-  // Retry up to 5 times with 500ms delay to handle race condition
-  for (let attempt = 1; attempt <= 5; attempt++) {
-    const { data } = await supabase
-      .from('discussion_posts')
-      .update({ telegram_message_id: groupThreadMessageId })
-      .eq('telegram_message_id', originalChannelMessageId)
-      .select()
-
-    if (data?.length) {
-      console.log(`updated thread id: ${originalChannelMessageId} → ${groupThreadMessageId} (attempt ${attempt})`)
-      return
+  // Group by user then by card
+  const byUser = {}
+  for (const c of data) {
+    const uid = c.telegram_user_id
+    if (!byUser[uid]) {
+      byUser[uid] = {
+        label: c.users?.username ? `@${c.users.username}` : c.users?.first_name ?? uid,
+        cards: {}
+      }
     }
-
-    console.log(`attempt ${attempt}: row not found yet, retrying...`)
-    await new Promise(r => setTimeout(r, 500))
+    const cardName = c.cards.name
+    byUser[uid].cards[cardName] = (byUser[uid].cards[cardName] ?? 0) + 1
   }
 
-  console.log(`failed to update thread id after 5 attempts: ${originalChannelMessageId} → ${groupThreadMessageId}`)
+  const lines = Object.values(byUser).map(u => {
+    const cardList = Object.entries(u.cards).map(([n, q]) => `  • ${n} x${q}`).join('\n')
+    return `👤 ${u.label}\n${cardList}`
+  }).join('\n\n')
+
+  ctx.reply(`📋 <b>Active Claims</b>\n\n${lines}`, { parse_mode: 'HTML' })
+})
+
+// ─── Unified message handler ──────────────────────────────────────────────────
+
+bot.on('message', async (ctx) => {
+  const msg = ctx.message
+
+  // 1. Forward listener
+  const fwd = msg?.forward_from_chat
+  if (fwd && fwd.id.toString() === CHANNEL_ID.toString()) {
+    const originalChannelMessageId = msg?.forward_from_message_id
+    const groupThreadMessageId     = msg?.message_id
+
+    if (originalChannelMessageId && groupThreadMessageId) {
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        const { data } = await supabase
+          .from('discussion_posts')
+          .update({ telegram_message_id: groupThreadMessageId })
+          .eq('telegram_message_id', originalChannelMessageId)
+          .select()
+
+        if (data?.length) {
+          console.log(`updated thread id: ${originalChannelMessageId} → ${groupThreadMessageId} (attempt ${attempt})`)
+          return
+        }
+        console.log(`attempt ${attempt}: row not found yet, retrying...`)
+        await new Promise(r => setTimeout(r, 500))
+      }
+      console.log(`failed to update thread id after 5 attempts`)
+    }
+    return
+  }
+
+  if (ctx.chat.type !== 'private') return
+
+  const userId = ctx.from.id
+  const state  = pendingAddress.get(userId)
+
+  // 2. SingPost shipping screenshot
+  if (msg.photo && state?.step === 'awaiting_shipping_screenshot') {
+    const shippingScreenshot = msg.photo.at(-1).file_id
+    pendingAddress.set(userId, { ...state, step: 'awaiting_name', shippingScreenshot })
+    return ctx.reply(
+      `✅ Shipping payment screenshot received!\n\nNow I need your delivery details. Please enter your <b>full name</b>:`,
+      { parse_mode: 'HTML' }
+    )
+  }
+
+  // 3. Main payment screenshot
+  if (msg.photo && !state) {
+    await upsertUser(ctx.from)
+
+    const { data: claims } = await supabase
+      .from('claims')
+      .select('cards(name, price)')
+      .eq('telegram_user_id', userId)
+
+    if (!claims?.length) {
+      return ctx.reply(
+        "⚠️ You don't have any active claims. Please comment <b>claim</b> on a card first before sending payment.",
+        { parse_mode: 'HTML' }
+      )
+    }
+
+    const photoFileId = msg.photo.at(-1).file_id
+    await supabase.from('users').update({ pending_screenshot: photoFileId }).eq('telegram_user_id', userId)
+
+    const { lines, total } = buildInvoiceSummary(claims)
+
+    await ctx.reply(
+      `✅ Screenshot received!\n\n` +
+      `🧾 <b>Your order:</b>\n${lines}\n\n` +
+      `━━━━━━━━━━━━━━\n` +
+      `<b>Total: $${total.toFixed(2)}</b>`,
+      { parse_mode: 'HTML' }
+    )
+    return showCollectionMenu(ctx)
+  }
+
+  // 4. Address collection steps
+  if (msg.text && state) {
+    const text = msg.text.trim()
+
+    if (state.step === 'awaiting_name') {
+      pendingAddress.set(userId, { ...state, step: 'awaiting_contact', name: text })
+      return ctx.reply('📞 Please enter your <b>contact number</b>:', { parse_mode: 'HTML' })
+    }
+    if (state.step === 'awaiting_contact') {
+      pendingAddress.set(userId, { ...state, step: 'awaiting_address', contact: text })
+      return ctx.reply('🏠 Please enter your <b>address</b> (block/street/unit):', { parse_mode: 'HTML' })
+    }
+    if (state.step === 'awaiting_address') {
+      pendingAddress.set(userId, { ...state, step: 'awaiting_postal', address: text })
+      return ctx.reply('📮 Please enter your <b>postal code</b>:', { parse_mode: 'HTML' })
+    }
+    if (state.step === 'awaiting_postal') {
+      const { name, contact, address, shippingScreenshot } = state
+      const postal = text
+      pendingAddress.delete(userId)
+
+      await notifyAdmins(ctx, userId, 'singpost_mailing', 4, {
+        name, contact, address, postal, shippingScreenshot,
+      })
+
+      return ctx.reply(`Your collection method has been confirmed! ✅\n\n<i>PM @allthingstcgadmin for any further inquiries</i> 💬\n\n<b>Thank you for your support!</b> 🙇🏻‍♂️`, { parse_mode: 'HTML' })
+    }
+  }
 })
 
 // ─── Launch ───────────────────────────────────────────────────────────────────
