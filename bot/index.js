@@ -3,6 +3,8 @@ import { createClient } from '@supabase/supabase-js'
 import * as dotenv from 'dotenv'
 dotenv.config()
 
+const PAYNOW_QR = 'https://gduougkrnrkpcqzcrbim.supabase.co/storage/v1/object/sign/Images/AllThingsTCGQRCode.jpg?token=eyJraWQiOiJzdG9yYWdlLXVybC1zaWduaW5nLWtleV8xYTUzNWY2Ni01ZDVlLTQ1M2ItYmFjYi01ZmY2YzI2MjFlN2IiLCJhbGciOiJIUzI1NiJ9.eyJ1cmwiOiJJbWFnZXMvQWxsVGhpbmdzVENHUVJDb2RlLmpwZyIsImlhdCI6MTc4MDkwMjI1OCwiZXhwIjozMzU3NzAyMjU4fQ.USmHc1a-NwFBt5IOlSx5v3lI0tC0x0KLzizs4elVLT4'
+
 const bot = new Telegraf(process.env.BOT_TOKEN)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY)
 
@@ -321,7 +323,10 @@ bot.command('invoice', async (ctx) => {
     `<b>Total: $${total.toFixed(2)}</b>\n\n` +
     `Paynow to UEN <code>T26LL0533A</code> with your telegram username in the reference! Send your payment screenshot directly to this bot and we'll verify it shortly.`
 
-  await ctx.telegram.sendMessage(userId, msg, { parse_mode: 'HTML' })
+  await ctx.telegram.sendPhoto(userId, PAYNOW_QR, {
+    caption: msg,
+    parse_mode: 'HTML',
+  })
 
   if (ctx.chat.type !== 'private') {
     ctx.reply(`📩 Invoice sent to your DM, ${ctx.from.first_name}!`)
@@ -402,17 +407,16 @@ bot.action('confirm_tiktok', async (ctx) => {
 bot.action('collect_singpost', async (ctx) => {
   await ctx.answerCbQuery()
   await ctx.editMessageReplyMarkup(undefined)
-  ctx.reply(
-    `Please confirm your option for Singpost Polymailer ⚠️\n\n` +
-    `Do paynow $4 to UEN <code>T26LL0533A</code> with your telegram username in the reference!`,
-    {
-      parse_mode: 'HTML',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('✅ Confirm', 'confirm_singpost')],
-        [Markup.button.callback('↩️ Go Back', 'go_back')],
-      ])
-    }
-  )
+  await ctx.replyWithPhoto(PAYNOW_QR, {
+    caption:
+      `Please confirm your option for Singpost Polymailer ⚠️\n\n` +
+      `Do paynow $4 to UEN <code>T26LL0533A</code> with your telegram username in the reference!`,
+    parse_mode: 'HTML',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Confirm', 'confirm_singpost')],
+      [Markup.button.callback('↩️ Go Back', 'go_back')],
+    ])
+  })
 })
 
 bot.action('confirm_singpost', async (ctx) => {
