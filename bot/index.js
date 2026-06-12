@@ -11,6 +11,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SEC
 const CHANNEL_ID          = process.env.CHANNEL_ID
 const ADMIN_IDS           = (process.env.ADMIN_IDS ?? '').split(',').map(Number)
 const ADMIN_USERNAME      = process.env.ADMIN_USERNAME
+const ADMIN_GROUP_ID      = -1004210390133
 
 const pendingAddress = new Map()
 
@@ -44,7 +45,6 @@ async function getCardByThread(ctx) {
 }
 
 function buildInvoiceSummary(claims) {
-  // Group claims by card name + price
   const grouped = {}
   for (const c of claims) {
     const key = c.cards.id
@@ -96,8 +96,8 @@ bot.command('postcards', async (ctx) => {
         `📂 ${category}\n` +
         `💰 <b>$${Number(card.price).toFixed(2)}</b>\n` +
         `📦 Stock: ${card.quantity}\n\n` +
-        `💬 Comment <b>claim</b> or <b>claim 2</b> to grab this card!\n` +
-        `↩️ Comment <b>unclaim</b> or <b>unclaim 2</b> to release.`
+        `💬 Comment <b>claim</b> or <b>claim [qty]</b> to grab this card!\n` +
+        `↩️ Comment <b>unclaim</b> or <b>unclaim [qty]</b> to release.`
 
       const { data: existingPost } = await supabase
         .from('discussion_posts')
@@ -150,7 +150,6 @@ bot.command('postcards', async (ctx) => {
 })
 
 // ─── Claim ────────────────────────────────────────────────────────────────────
-// Matches: "claim", "claim 2", "claim 10", etc.
 
 bot.hears(/^claim(\s+\d+)?$/i, async (ctx) => {
   if (!ctx.message?.message_thread_id) return
@@ -158,7 +157,6 @@ bot.hears(/^claim(\s+\d+)?$/i, async (ctx) => {
   const chatId = ctx.message.chat.id
   const replyTo = { reply_parameters: { message_id: ctx.message.message_id } }
 
-  // Parse quantity from message — default 1
   const match = ctx.message.text.trim().match(/^claim\s+(\d+)$/i)
   const requestedQty = match ? parseInt(match[1], 10) : 1
 
@@ -179,13 +177,11 @@ bot.hears(/^claim(\s+\d+)?$/i, async (ctx) => {
     return ctx.telegram.sendMessage(chatId, `❌ This card is no longer available.`, replyTo)
   }
 
-  // Count total active claims for this card
   const { count: totalClaimed } = await supabase
     .from('claims')
     .select('id', { count: 'exact', head: true })
     .eq('card_id', card.id)
 
-  // Count how many this specific user has already claimed
   const { count: userClaimed } = await supabase
     .from('claims')
     .select('id', { count: 'exact', head: true })
@@ -205,7 +201,6 @@ bot.hears(/^claim(\s+\d+)?$/i, async (ctx) => {
     )
   }
 
-  // Insert one row per unit claimed (keeps unclaim-by-quantity logic simple)
   const rows = Array.from({ length: requestedQty }, () => ({
     card_id:          card.id,
     telegram_user_id: userId,
@@ -225,7 +220,6 @@ bot.hears(/^claim(\s+\d+)?$/i, async (ctx) => {
 })
 
 // ─── Unclaim ──────────────────────────────────────────────────────────────────
-// Matches: "unclaim", "unclaim 2", "unclaim 10", etc.
 
 bot.hears(/^unclaim(\s+\d+)?$/i, async (ctx) => {
   if (!ctx.message?.message_thread_id) return
@@ -233,7 +227,6 @@ bot.hears(/^unclaim(\s+\d+)?$/i, async (ctx) => {
   const chatId = ctx.message.chat.id
   const replyTo = { reply_parameters: { message_id: ctx.message.message_id } }
 
-  // Parse quantity — default 1
   const match = ctx.message.text.trim().match(/^unclaim\s+(\d+)$/i)
   const requestedQty = match ? parseInt(match[1], 10) : 1
 
@@ -247,7 +240,6 @@ bot.hears(/^unclaim(\s+\d+)?$/i, async (ctx) => {
   const { cards: card } = post
   const userId = ctx.from.id
 
-  // Fetch user's claims for this card, oldest first
   const { data: userClaims } = await supabase
     .from('claims')
     .select('id')
@@ -266,7 +258,6 @@ bot.hears(/^unclaim(\s+\d+)?$/i, async (ctx) => {
     )
   }
 
-  // Delete the oldest N claims
   const idsToDelete = userClaims.slice(0, requestedQty).map(c => c.id)
   await supabase.from('claims').delete().in('id', idsToDelete)
 
@@ -460,7 +451,6 @@ async function notifyAdmins(ctx, userId, collectionMethod, shippingFee, shipping
   const itemTotal = (claims ?? []).reduce((sum, c) => sum + Number(c.cards.price), 0)
   const grandTotal = itemTotal + shippingFee
 
-  // Group items for admin caption
   const grouped = {}
   for (const c of (claims ?? [])) {
     const key = c.cards.name
@@ -512,21 +502,20 @@ async function notifyAdmins(ctx, userId, collectionMethod, shippingFee, shipping
 
   adminCaption += `\n\nTo confirm payment:\n<code>/markpaid ${userId}</code>`
 
-  for (const adminId of ADMIN_IDS) {
-    try {
-      if (photoFileId) {
-        await ctx.telegram.sendPhoto(adminId, photoFileId, { caption: adminCaption, parse_mode: 'HTML' })
-      } else {
-        await ctx.telegram.sendMessage(adminId, adminCaption, { parse_mode: 'HTML' })
-      }
-      if (shippingDetails?.shippingScreenshot) {
-        await ctx.telegram.sendPhoto(adminId, shippingDetails.shippingScreenshot, {
-          caption: `📮 Shipping payment screenshot for ${username}`,
-        })
-      }
-    } catch (e) {
-      console.log(`Could not notify admin ${adminId}:`, e.message)
+  // ── Send to admin group instead of individual admins ──
+  try {
+    if (photoFileId) {
+      await ctx.telegram.sendPhoto(ADMIN_GROUP_ID, photoFileId, { caption: adminCaption, parse_mode: 'HTML' })
+    } else {
+      await ctx.telegram.sendMessage(ADMIN_GROUP_ID, adminCaption, { parse_mode: 'HTML' })
     }
+    if (shippingDetails?.shippingScreenshot) {
+      await ctx.telegram.sendPhoto(ADMIN_GROUP_ID, shippingDetails.shippingScreenshot, {
+        caption: `📮 Shipping payment screenshot for ${username}`,
+      })
+    }
+  } catch (e) {
+    console.log(`Could not notify admin group:`, e.message)
   }
 }
 
@@ -596,7 +585,6 @@ bot.command('markpaid', async (ctx) => {
     pending_recipient_postal:   null,
   }).eq('telegram_user_id', targetId)
 
-  // Group items for confirmation message
   const grouped = {}
   for (const c of claims) {
     const key = c.cards.name
@@ -641,7 +629,6 @@ bot.command('claims', async (ctx) => {
   if (error) return ctx.reply(`❌ ${error.message}`)
   if (!data?.length) return ctx.reply('No active claims.')
 
-  // Group by user then by card
   const byUser = {}
   for (const c of data) {
     const uid = c.telegram_user_id
