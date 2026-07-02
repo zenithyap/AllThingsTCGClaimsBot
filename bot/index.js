@@ -65,25 +65,60 @@ function buildInvoiceSummary(claims) {
 bot.command('postcards', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('⛔ Admins only.')
 
-  const specificId = ctx.message.text.split(' ')[1]?.trim()
+  const categorySlug = ctx.message.text.split(' ')[1]?.trim().toLowerCase()
 
   let query = supabase
     .from('available_cards')
     .select('id, name, price, quantity, front_image_url, back_image_url, category_name')
 
-  if (specificId) {
-    query = supabase
-      .from('cards')
-      .select('id, name, price, quantity, front_image_url, back_image_url, categories(name)')
-      .eq('id', specificId)
-      .eq('is_active', true)
+  let categoryLabel = null
+
+  if (categorySlug) {
+    const { data: category } = await supabase
+      .from('categories')
+      .select('id, name, slug')
+      .eq('slug', categorySlug)
+      .single()
+
+    if (!category) {
+      const { data: cats } = await supabase
+        .from('categories')
+        .select('name, slug')
+        .order('name')
+
+      const list = (cats ?? [])
+        .map(c => `• <code>${c.slug}</code> — ${c.name}`)
+        .join('\n')
+
+      return ctx.reply(
+        `❌ Unknown category: <code>${categorySlug}</code>\n\n` +
+        `<b>Available categories:</b>\n${list}\n\n` +
+        `Usage: <code>/postcards eng-vintage</code>`,
+        { parse_mode: 'HTML' }
+      )
+    }
+
+    categoryLabel = category.name
+    query = query.eq('category_id', category.id)
   }
 
   const { data: cards, error } = await query
   if (error) return ctx.reply(`❌ DB error: ${error.message}`)
-  if (!cards?.length) return ctx.reply('No cards to post. All active cards have already been posted, or no cards found.')
+  if (!cards?.length) {
+    return ctx.reply(
+      categorySlug
+        ? `No cards to post in <b>${categoryLabel}</b>. All active cards in this category have already been posted, or none exist.`
+        : 'No cards to post. All active cards have already been posted, or no cards found.',
+      { parse_mode: 'HTML' }
+    )
+  }
 
-  await ctx.reply(`📤 Posting ${cards.length} card(s) to the channel...`)
+  await ctx.reply(
+    categorySlug
+      ? `📤 Posting ${cards.length} card(s) from <b>${categoryLabel}</b> to the channel...`
+      : `📤 Posting ${cards.length} card(s) to the channel...`,
+    { parse_mode: 'HTML' }
+  )
 
   let posted = 0
   let failed = 0
@@ -114,16 +149,28 @@ bot.command('postcards', async (ctx) => {
         await supabase.from('discussion_posts').delete().eq('card_id', card.id)
       }
 
+      // Treat empty/whitespace-only URLs as missing
+      const frontImage = card.front_image_url?.trim() || null
+      const backImage  = card.back_image_url?.trim()  || null
+
       let sentMessage
 
-      if (card.front_image_url && card.back_image_url) {
-        const mediaGroup = await ctx.telegram.sendMediaGroup(CHANNEL_ID, [
-          { type: 'photo', media: card.front_image_url, caption, parse_mode: 'HTML' },
-          { type: 'photo', media: card.back_image_url },
-        ])
-        sentMessage = mediaGroup[0]
-      } else if (card.front_image_url) {
-        sentMessage = await ctx.telegram.sendPhoto(CHANNEL_ID, card.front_image_url, {
+      if (frontImage && backImage) {
+        try {
+          const mediaGroup = await ctx.telegram.sendMediaGroup(CHANNEL_ID, [
+            { type: 'photo', media: frontImage, caption, parse_mode: 'HTML' },
+            { type: 'photo', media: backImage },
+          ])
+          sentMessage = mediaGroup[0]
+        } catch (e) {
+          // Back image may be broken/unreachable — fall back to front only
+          console.log(`media group failed for card ${card.id}, retrying with front image only:`, e.message)
+          sentMessage = await ctx.telegram.sendPhoto(CHANNEL_ID, frontImage, {
+            caption, parse_mode: 'HTML',
+          })
+        }
+      } else if (frontImage) {
+        sentMessage = await ctx.telegram.sendPhoto(CHANNEL_ID, frontImage, {
           caption, parse_mode: 'HTML',
         })
       } else {
