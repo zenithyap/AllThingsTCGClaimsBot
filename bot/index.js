@@ -261,7 +261,7 @@ bot.hears(/^claim(\s+\d+)?$/i, async (ctx) => {
   const qtyMsg = requestedQty > 1 ? ` x${requestedQty}` : ''
 
   ctx.telegram.sendMessage(chatId,
-    `✅ <b>${card.name}</b>${qtyMsg} claimed by ${name}! 🎉${remainingMsg}\nType /invoice in DM to see your cart.`,
+    `✅ <b>${card.name}</b>${qtyMsg} claimed by ${name}! 🎉${remainingMsg}\nDM @AllThingsTCGClaimsBot with /invoice to checkout your finalised cart!.`,
     { parse_mode: 'HTML', ...replyTo }
   )
 })
@@ -347,7 +347,7 @@ bot.command('invoice', async (ctx) => {
 
   if (!claims?.length) {
     return ctx.telegram.sendMessage(userId,
-      "🛒 You haven't claimed any cards yet.\n\nComment <b>claim</b> under a card listing to grab one.",
+      "🛒 You haven't claimed any cards yet.\n\nComment <b>claim</b> under a card listing in @allthingstcgclaims to grab one.",
       { parse_mode: 'HTML' }
     )
   }
@@ -355,11 +355,13 @@ bot.command('invoice', async (ctx) => {
   const { lines, total } = buildInvoiceSummary(claims)
 
   const msg =
-    `🧾 <b>Your Invoice</b>\n\n` +
+    `🧾 <b>Your Invoice</b>\n` +
+    `<i>User ID: ${userId}</i>\n\n` +
     `${lines}\n\n` +
     `━━━━━━━━━━━━━━\n` +
     `<b>Total: $${total.toFixed(2)}</b>\n\n` +
-    `Paynow to UEN <code>T26LL0533A</code> with your telegram username in the reference! Send your payment screenshot directly to this bot and we'll verify it shortly.`
+    `Paynow to UEN <code>T26LL0533A</code> with your telegram username in the reference! Send your payment screenshot directly to this bot and we'll verify it shortly.\n\n` +
+    `If you’re using CDC vouchers, forward this message to @allthingstcgadmin and send the CDC QR Code screenshots to redeem!`
 
   await ctx.telegram.sendPhoto(userId, PAYNOW_QR, {
     caption: msg,
