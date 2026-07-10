@@ -185,7 +185,7 @@ bot.command('postcards', async (ctx) => {
       })
 
       posted++
-      await new Promise(r => setTimeout(r, 1500))
+      await new Promise(r => setTimeout(r, 5000))
 
     } catch (err) {
       console.error(`Failed to post card ${card.id}:`, err.message)
