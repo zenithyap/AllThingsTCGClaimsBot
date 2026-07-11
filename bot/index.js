@@ -188,7 +188,7 @@ bot.hears(/^claim(\s+\d+)?$/i, async (ctx) => {
   const qtyMsg = requestedQty > 1 ? ` x${requestedQty}` : ''
 
   ctx.telegram.sendMessage(chatId,
-    `✅ <b>${card.name}</b>${qtyMsg} claimed by ${name}! 🎉${remainingMsg}\nDM @AllThingsTCGClaimsBot with /invoice to checkout your finalised cart!.`,
+    `✅ <b>${card.name}</b>${qtyMsg} claimed by ${name}! 🎉${remainingMsg}\nDM @AllThingsTCGClaimsBot with /invoice to checkout your finalised cart!`,
     { parse_mode: 'HTML', ...replyTo }
   )
 })
