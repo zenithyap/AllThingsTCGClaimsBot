@@ -1,6 +1,7 @@
 import { Telegraf, Markup } from 'telegraf'
 import { createClient } from '@supabase/supabase-js'
 import * as dotenv from 'dotenv'
+import { runPostcardsBatch } from './postcards.js'
 dotenv.config()
 
 const PAYNOW_QR = 'https://gduougkrnrkpcqzcrbim.supabase.co/storage/v1/object/sign/Images/AllThingsTCGQRCode.jpg?token=eyJraWQiOiJzdG9yYWdlLXVybC1zaWduaW5nLWtleV8xYTUzNWY2Ni01ZDVlLTQ1M2ItYmFjYi01ZmY2YzI2MjFlN2IiLCJhbGciOiJIUzI1NiJ9.eyJ1cmwiOiJJbWFnZXMvQWxsVGhpbmdzVENHUVJDb2RlLmpwZyIsImlhdCI6MTc4MDkwMjI1OCwiZXhwIjozMzU3NzAyMjU4fQ.USmHc1a-NwFBt5IOlSx5v3lI0tC0x0KLzizs4elVLT4'
@@ -78,18 +79,23 @@ function buildInvoiceSummary(claims) {
 bot.command('postcards', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('⛔ Admins only.')
 
-  const categorySlug = ctx.message.text.split(' ')[1]?.trim().toLowerCase()
+  // Usage: /postcards [category] [page]
+  // Batches chain automatically; page is only for resuming a broken chain.
+  const parts = ctx.message.text.trim().split(/\s+/)
+  let categorySlug = parts[1]?.toLowerCase()
+  let page = parseInt(parts[2], 10)
 
-  let query = supabase
-    .from('available_cards')
-    .select('id, name, price, quantity, front_image_url, back_image_url, category_name')
-
-  let categoryLabel = null
+  // Allow "/postcards 2" (page without category)
+  if (categorySlug && /^\d+$/.test(categorySlug)) {
+    page = parseInt(categorySlug, 10)
+    categorySlug = undefined
+  }
+  if (!Number.isInteger(page) || page < 1) page = 1
 
   if (categorySlug) {
     const { data: category } = await supabase
       .from('categories')
-      .select('id, name, slug')
+      .select('slug')
       .eq('slug', categorySlug)
       .single()
 
@@ -110,86 +116,12 @@ bot.command('postcards', async (ctx) => {
         { parse_mode: 'HTML' }
       )
     }
-
-    categoryLabel = category.name
-    query = query.eq('category_id', category.id)
   }
 
-  const { data: cards, error } = await query
-  if (error) return ctx.reply(`❌ DB error: ${error.message}`)
-  if (!cards?.length) {
-    return ctx.reply(
-      categorySlug
-        ? `No cards to post in <b>${categoryLabel}</b>. No active, unclaimed cards with stock in this category.`
-        : 'No cards to post. No active, unclaimed cards with stock found.',
-      { parse_mode: 'HTML' }
-    )
-  }
-
-  await ctx.reply(
-    categorySlug
-      ? `📤 Posting ${cards.length} card(s) from <b>${categoryLabel}</b> to the channel...`
-      : `📤 Posting ${cards.length} card(s) to the channel...`,
-    { parse_mode: 'HTML' }
-  )
-
-  let posted = 0
-  let failed = 0
-
-  for (const card of cards) {
-    try {
-      const category = card.category_name ?? card.categories?.name ?? 'Uncategorised'
-      // The 🃏 emoji carries a hidden deep-link with the card id so
-      // claim/unclaim comments can identify the card without a DB mapping.
-      const cardLink = `https://t.me/AllThingsTCGClaimsBot?start=card_${card.id}`
-      const caption =
-        `<a href="${cardLink}">🃏</a> <b>${card.name}</b>\n` +
-        `📂 ${category}\n` +
-        `💰 <b>$${Number(card.price).toFixed(2)}</b>\n` +
-        `📦 Stock: ${card.quantity}\n\n` +
-        `💬 Comment <b>claim</b> or <b>claim [qty]</b> to grab this card!\n` +
-        `↩️ Comment <b>unclaim</b> or <b>unclaim [qty]</b> to release.`
-
-      // Treat empty/whitespace-only URLs as missing
-      const frontImage = card.front_image_url?.trim() || null
-      const backImage  = card.back_image_url?.trim()  || null
-
-      if (frontImage && backImage) {
-        try {
-          await ctx.telegram.sendMediaGroup(CHANNEL_ID, [
-            { type: 'photo', media: frontImage, caption, parse_mode: 'HTML' },
-            { type: 'photo', media: backImage },
-          ])
-        } catch (e) {
-          // Back image may be broken/unreachable — fall back to front only
-          console.log(`media group failed for card ${card.id}, retrying with front image only:`, e.message)
-          await ctx.telegram.sendPhoto(CHANNEL_ID, frontImage, {
-            caption, parse_mode: 'HTML',
-          })
-        }
-      } else if (frontImage) {
-        await ctx.telegram.sendPhoto(CHANNEL_ID, frontImage, {
-          caption, parse_mode: 'HTML',
-        })
-      } else {
-        await ctx.telegram.sendMessage(CHANNEL_ID, caption, {
-          parse_mode: 'HTML',
-        })
-      }
-
-      posted++
-      await new Promise(r => setTimeout(r, 5000))
-
-    } catch (err) {
-      console.error(`Failed to post card ${card.id}:`, err.message)
-      failed++
-      // Honor Telegram's flood-control wait so subsequent cards don't also fail
-      // const retryAfter = err.response?.parameters?.retry_after
-      // if (retryAfter) await new Promise(r => setTimeout(r, (retryAfter + 1) * 1000))
-    }
-  }
-
-  ctx.reply(`✅ Done! Posted: ${posted} card(s)` + (failed ? ` | ❌ Failed: ${failed}` : ''))
+  // Posts one batch of 20, then chains the next batch through
+  // /api/postbatch in a fresh invocation — any number of cards
+  // works from this single command.
+  await runPostcardsBatch({ categorySlug, page, reportChatId: ctx.chat.id })
 })
 
 // ─── Claim ────────────────────────────────────────────────────────────────────
