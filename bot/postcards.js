@@ -12,7 +12,7 @@ const CHANNEL_ID = process.env.CHANNEL_ID
 // Each batch runs in its own Vercel invocation (fresh 300s window) and
 // chains the next batch via /api/postbatch.
 export const PAGE_SIZE = 20
-const DELAY_MS = 7000
+const DELAY_MS = 1000
 
 export async function runPostcardsBatch({ categorySlug, page = 1, reportChatId, totals = { posted: 0, failed: 0 } }) {
   let query = supabase
