@@ -184,8 +184,8 @@ bot.command('postcards', async (ctx) => {
       console.error(`Failed to post card ${card.id}:`, err.message)
       failed++
       // Honor Telegram's flood-control wait so subsequent cards don't also fail
-      const retryAfter = err.response?.parameters?.retry_after
-      if (retryAfter) await new Promise(r => setTimeout(r, (retryAfter + 1) * 1000))
+      // const retryAfter = err.response?.parameters?.retry_after
+      // if (retryAfter) await new Promise(r => setTimeout(r, (retryAfter + 1) * 1000))
     }
   }
 
