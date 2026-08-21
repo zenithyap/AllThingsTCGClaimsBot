@@ -168,7 +168,7 @@ export async function runPostcardsBatch({
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "x-internal-secret": process.env.INTERNAL_SECRET,
+        "x-internal-secret": process.env.BOT_TOKEN,
       },
       body: JSON.stringify({
         categorySlug,
