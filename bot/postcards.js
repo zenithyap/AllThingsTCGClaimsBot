@@ -1,5 +1,6 @@
 import { Telegram } from "telegraf";
 import { createClient } from "@supabase/supabase-js";
+import { Client } from "@upstash/qstash";
 import { waitUntil } from "@vercel/functions";
 import * as dotenv from "dotenv";
 dotenv.config();
@@ -10,6 +11,12 @@ const supabase = createClient(
   process.env.SUPABASE_SECRET_KEY,
 );
 const CHANNEL_ID = process.env.CHANNEL_ID;
+const qstash = process.env.QSTASH_TOKEN
+  ? new Client({
+      baseUrl: "https://qstash-us-east-1.upstash.io",
+      token: process.env.QSTASH_TOKEN,
+    })
+  : null;
 
 // Telegram allows ~20 messages/min per channel and a front+back card
 // counts as 2 messages, so we post in batches at a compliant pace.
@@ -153,42 +160,63 @@ export async function runPostcardsBatch({
       `✅ Batch ${page} of ${totalPages} done...`,
     );
 
+    const nextBatch = {
+      categorySlug,
+      page: page + 1,
+      reportChatId,
+      totals,
+    };
+
     const host =
       process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_URL;
+
     if (!host) {
-      return runPostcardsBatch({
-        categorySlug,
-        page: page + 1,
-        reportChatId,
-        totals,
-      });
+      return runPostcardsBatch(nextBatch);
     }
 
-    const triggerNext = fetch(`https://${host}/api/postbatch`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-internal-secret": process.env.BOT_TOKEN,
-      },
-      body: JSON.stringify({
-        categorySlug,
-        page: page + 1,
-        reportChatId,
-        totals,
-      }),
-    }).catch((e) => {
-      console.error("Failed to chain next batch:", e.message);
-      const nextCmd = categorySlug
-        ? `/postcards ${categorySlug} ${page + 1}`
-        : `/postcards ${page + 1}`;
-      return telegram.sendMessage(
-        reportChatId,
-        `⚠️ Could not start batch ${page + 1} automatically. Run <code>${nextCmd}</code> to continue.`,
-        { parse_mode: "HTML" },
-      );
-    });
+    const triggerNext = async () => {
+      if (qstash) {
+        const callbackUrl = `https://${host}/api/postbatch`;
 
-    waitUntil(triggerNext); // keeps this invocation alive just long enough to fire the request, without blocking its return
+        try {
+          await qstash.publishJSON({
+            url: callbackUrl,
+            body: nextBatch,
+            headers: {
+              "content-type": "application/json",
+              "x-internal-secret": process.env.BOT_TOKEN,
+            },
+            delay: "3s",
+          });
+          return;
+        } catch (e) {
+          console.error("Failed to queue next batch with QStash:", e.message);
+        }
+      }
+
+      try {
+        await fetch(`https://${host}/api/postbatch`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-internal-secret": process.env.BOT_TOKEN,
+          },
+          body: JSON.stringify(nextBatch),
+        });
+      } catch (e) {
+        console.error("Failed to chain next batch:", e.message);
+        const nextCmd = categorySlug
+          ? `/postcards ${categorySlug} ${page + 1}`
+          : `/postcards ${page + 1}`;
+        await telegram.sendMessage(
+          reportChatId,
+          `⚠️ Could not start batch ${page + 1} automatically. Run <code>${nextCmd}</code> to continue.`,
+          { parse_mode: "HTML" },
+        );
+      }
+    };
+
+    waitUntil(triggerNext());
     return;
   } else {
     await telegram.sendMessage(

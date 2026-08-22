@@ -1,6 +1,7 @@
 {
   "dependencies": {
     "@supabase/supabase-js": "^2.106.2",
+    "@upstash/qstash": "^2.11.3",
     "@vercel/functions": "^3.7.5",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
