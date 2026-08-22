@@ -189,6 +189,7 @@ export async function runPostcardsBatch({
     });
 
     waitUntil(triggerNext); // keeps this invocation alive just long enough to fire the request, without blocking its return
+    return;
   } else {
     await telegram.sendMessage(
       reportChatId,
