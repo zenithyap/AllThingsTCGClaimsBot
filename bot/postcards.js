@@ -18,6 +18,44 @@ const qstash = process.env.QSTASH_TOKEN
     })
   : null;
 
+export async function enqueuePostcardsBatch({
+  categorySlug,
+  page = 1,
+  reportChatId,
+  totals = { posted: 0, failed: 0 },
+}) {
+  const host =
+    process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_URL;
+
+  if (!host) {
+    return runPostcardsBatch({ categorySlug, page, reportChatId, totals });
+  }
+
+  const payload = { categorySlug, page, reportChatId, totals };
+
+  if (qstash) {
+    await qstash.publishJSON({
+      url: `https://${host}/api/postbatch`,
+      body: payload,
+      headers: {
+        "content-type": "application/json",
+        "x-internal-secret": process.env.BOT_TOKEN,
+      },
+      delay: "3s",
+    });
+    return;
+  }
+
+  await fetch(`https://${host}/api/postbatch`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-internal-secret": process.env.BOT_TOKEN,
+    },
+    body: JSON.stringify(payload),
+  });
+}
+
 // Telegram allows ~20 messages/min per channel and a front+back card
 // counts as 2 messages, so we post in batches at a compliant pace.
 // Each batch runs in its own Vercel invocation (fresh 300s window) and
@@ -167,56 +205,20 @@ export async function runPostcardsBatch({
       totals,
     };
 
-    const host =
-      process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_URL;
-
-    if (!host) {
-      return runPostcardsBatch(nextBatch);
+    try {
+      await enqueuePostcardsBatch(nextBatch);
+    } catch (e) {
+      console.error("Failed to chain next batch:", e.message);
+      const nextCmd = categorySlug
+        ? `/postcards ${categorySlug} ${page + 1}`
+        : `/postcards ${page + 1}`;
+      await telegram.sendMessage(
+        reportChatId,
+        `⚠️ Could not start batch ${page + 1} automatically. Run <code>${nextCmd}</code> to continue.`,
+        { parse_mode: "HTML" },
+      );
     }
 
-    const triggerNext = async () => {
-      if (qstash) {
-        const callbackUrl = `https://${host}/api/postbatch`;
-
-        try {
-          await qstash.publishJSON({
-            url: callbackUrl,
-            body: nextBatch,
-            headers: {
-              "content-type": "application/json",
-              "x-internal-secret": process.env.BOT_TOKEN,
-            },
-            delay: "3s",
-          });
-          return;
-        } catch (e) {
-          console.error("Failed to queue next batch with QStash:", e.message);
-        }
-      }
-
-      try {
-        await fetch(`https://${host}/api/postbatch`, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-internal-secret": process.env.BOT_TOKEN,
-          },
-          body: JSON.stringify(nextBatch),
-        });
-      } catch (e) {
-        console.error("Failed to chain next batch:", e.message);
-        const nextCmd = categorySlug
-          ? `/postcards ${categorySlug} ${page + 1}`
-          : `/postcards ${page + 1}`;
-        await telegram.sendMessage(
-          reportChatId,
-          `⚠️ Could not start batch ${page + 1} automatically. Run <code>${nextCmd}</code> to continue.`,
-          { parse_mode: "HTML" },
-        );
-      }
-    };
-
-    waitUntil(triggerNext());
     return;
   } else {
     await telegram.sendMessage(

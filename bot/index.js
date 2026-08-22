@@ -1,7 +1,7 @@
 import { Telegraf, Markup } from 'telegraf'
 import { createClient } from '@supabase/supabase-js'
 import * as dotenv from 'dotenv'
-import { runPostcardsBatch } from './postcards.js'
+import { enqueuePostcardsBatch } from './postcards.js'
 dotenv.config()
 
 const PAYNOW_QR = 'https://gduougkrnrkpcqzcrbim.supabase.co/storage/v1/object/sign/Images/AllThingsTCGQRCode.jpg?token=eyJraWQiOiJzdG9yYWdlLXVybC1zaWduaW5nLWtleV8xYTUzNWY2Ni01ZDVlLTQ1M2ItYmFjYi01ZmY2YzI2MjFlN2IiLCJhbGciOiJIUzI1NiJ9.eyJ1cmwiOiJJbWFnZXMvQWxsVGhpbmdzVENHUVJDb2RlLmpwZyIsImlhdCI6MTc4MDkwMjI1OCwiZXhwIjozMzU3NzAyMjU4fQ.USmHc1a-NwFBt5IOlSx5v3lI0tC0x0KLzizs4elVLT4'
@@ -118,10 +118,9 @@ bot.command('postcards', async (ctx) => {
     }
   }
 
-  // Posts one batch of 20, then chains the next batch through
-  // /api/postbatch in a fresh invocation — any number of cards
-  // works from this single command.
-  await runPostcardsBatch({ categorySlug, page, reportChatId: ctx.chat.id })
+  // Queue the first batch through QStash so the whole posting sequence is
+  // decoupled from the initial Vercel request timeout.
+  await enqueuePostcardsBatch({ categorySlug, page, reportChatId: ctx.chat.id })
 })
 
 // ─── Claim ────────────────────────────────────────────────────────────────────
