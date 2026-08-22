@@ -23,7 +23,7 @@ const qstash = process.env.QSTASH_TOKEN
 // Each batch runs in its own Vercel invocation (fresh 300s window) and
 // chains the next batch via /api/postbatch.
 export const PAGE_SIZE = 20;
-const DELAY_MS = 3000;
+const DELAY_MS = 4000;
 
 export async function runPostcardsBatch({
   categorySlug,
