@@ -382,7 +382,7 @@ async function showCollectionMenu(ctx) {
       parse_mode: 'HTML',
       ...Markup.inlineKeyboard([
         [Markup.button.callback('📦 Self Collect', 'collect_self')],
-        [Markup.button.callback('🛍️ TikTok Polymailer', 'collect_tiktok')],
+        [Markup.button.callback('🛍️ Carousell Polymailer', 'collect_carousell')],
         [Markup.button.callback('📮 SingPost Polymailer (+$4)', 'collect_singpost')],
       ])
     }
@@ -415,29 +415,29 @@ bot.action('confirm_self', async (ctx) => {
   ctx.reply(`Your collection method has been confirmed! ✅\n\n<i>PM @allthingstcgadmin for any further inquiries</i> 💬\n\n<b>Thank you for your support!</b> 🙇🏻‍♂️`, { parse_mode: 'HTML' })
 })
 
-// ─── Collection method: TikTok Polymailer ────────────────────────────────────
+// ─── Collection method: Carousell Polymailer ─────────────────────────────────
 
-bot.action('collect_tiktok', async (ctx) => {
+bot.action('collect_carousell', async (ctx) => {
   await ctx.answerCbQuery()
   await ctx.editMessageReplyMarkup(undefined)
   ctx.reply(
-    `Please confirm your option for Tiktok Polymailer ⚠️\n\n` +
-    `Order the Tiktok Polymailer under "Re:Born" below and the items will be shipped to your registered address in Tiktok! ⬇️\n` +
-    `https://vt.tiktok.com/ZS92aPRb2F33S-clqGk/\n\n` +
-    `PM @allthingstcgadmin if the link does not work! ⛓️‍💥`,
+    `Please confirm your option for Carousell Polymailer ⚠️\n\n` +
+    `Order the Carousell Polymailer below and the items will be shipped to your registered address in Carousell! ⬇️\n` +
+    `https://carousell.app.link/4vUD0Lvi07b\n\n` +
+    `PM @allthingstcgadmin if the link does not work!`,
     {
       ...Markup.inlineKeyboard([
-        [Markup.button.callback('✅ Confirm', 'confirm_tiktok')],
+        [Markup.button.callback('✅ Confirm', 'confirm_carousell')],
         [Markup.button.callback('↩️ Go Back', 'go_back')],
       ])
     }
   )
 })
 
-bot.action('confirm_tiktok', async (ctx) => {
+bot.action('confirm_carousell', async (ctx) => {
   await ctx.answerCbQuery()
   const userId = ctx.from.id
-  await notifyAdmins(ctx, userId, 'tiktok_polymailer', 0)
+  await notifyAdmins(ctx, userId, 'carousell_polymailer', 0)
   await ctx.editMessageReplyMarkup(undefined)
   ctx.reply(`Your collection method has been confirmed! ✅\n\n<i>PM @allthingstcgadmin for any further inquiries</i> 💬\n\n<b>Thank you for your support!</b> 🙇🏻‍♂️`, { parse_mode: 'HTML' })
 })
@@ -512,7 +512,8 @@ async function notifyAdmins(ctx, userId, collectionMethod, shippingFee, shipping
 
   const methodLabel = {
     self_collect:      '📦 Self Collect',
-    tiktok_polymailer: '🛍️ TikTok Polymailer',
+    carousell_polymailer: '🛍️ Carousell Polymailer',
+    tiktok_polymailer:    '🛍️ TikTok Polymailer',
     singpost_mailing:  '📮 SingPost Polymailer',
   }[collectionMethod] ?? collectionMethod
 
@@ -646,7 +647,8 @@ bot.command('markpaid', async (ctx) => {
 
   const methodLabel = {
     self_collect:      '📦 Self Collect',
-    tiktok_polymailer: '🛍️ TikTok Polymailer',
+    carousell_polymailer: '🛍️ Carousell Polymailer',
+    tiktok_polymailer:    '🛍️ TikTok Polymailer',
     singpost_mailing:  '📮 SingPost Polymailer',
   }[collectionMethod] ?? collectionMethod
 
