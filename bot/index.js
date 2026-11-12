@@ -1,6 +1,7 @@
 import { Telegraf, Markup } from 'telegraf'
 import { createClient } from '@supabase/supabase-js'
 import * as dotenv from 'dotenv'
+import { enqueuePostcardsBatch } from './postcards.js'
 dotenv.config()
 
 const PAYNOW_QR = 'https://gduougkrnrkpcqzcrbim.supabase.co/storage/v1/object/sign/Images/AllThingsTCGQRCode.jpg?token=eyJraWQiOiJzdG9yYWdlLXVybC1zaWduaW5nLWtleV8xYTUzNWY2Ni01ZDVlLTQ1M2ItYmFjYi01ZmY2YzI2MjFlN2IiLCJhbGciOiJIUzI1NiJ9.eyJ1cmwiOiJJbWFnZXMvQWxsVGhpbmdzVENHUVJDb2RlLmpwZyIsImlhdCI6MTc4MDkwMjI1OCwiZXhwIjozMzU3NzAyMjU4fQ.USmHc1a-NwFBt5IOlSx5v3lI0tC0x0KLzizs4elVLT4'
@@ -31,14 +32,27 @@ async function upsertUser(from) {
   }, { onConflict: 'telegram_user_id' })
 }
 
-async function getCardByThread(ctx) {
-  const threadId = ctx.message?.message_thread_id
-  if (!threadId) return null
+// Resolve the card from the channel post the user is commenting on.
+// Each posted card embeds its id as a hidden deep-link on the 🃏 emoji,
+// which survives the auto-forward into the discussion group.
+async function getCardFromReply(ctx) {
+  const root = ctx.message?.reply_to_message
+  if (!root) return null
+
+  const entities = root.caption_entities ?? root.entities ?? []
+  let cardId = null
+  for (const e of entities) {
+    if (e.type === 'text_link' && e.url) {
+      const m = e.url.match(/start=card_([0-9a-f-]{36})/i)
+      if (m) { cardId = m[1]; break }
+    }
+  }
+  if (!cardId) return null
 
   const { data } = await supabase
-    .from('discussion_posts')
-    .select('card_id, cards(*)')
-    .eq('telegram_message_id', threadId)
+    .from('cards')
+    .select('*')
+    .eq('id', cardId)
     .single()
 
   return data ?? null
@@ -65,18 +79,23 @@ function buildInvoiceSummary(claims) {
 bot.command('postcards', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('⛔ Admins only.')
 
-  const categorySlug = ctx.message.text.split(' ')[1]?.trim().toLowerCase()
+  // Usage: /postcards [category] [page]
+  // Batches chain automatically; page is only for resuming a broken chain.
+  const parts = ctx.message.text.trim().split(/\s+/)
+  let categorySlug = parts[1]?.toLowerCase()
+  let page = parseInt(parts[2], 10)
 
-  let query = supabase
-    .from('available_cards')
-    .select('id, name, price, quantity, front_image_url, back_image_url, category_name')
-
-  let categoryLabel = null
+  // Allow "/postcards 2" (page without category)
+  if (categorySlug && /^\d+$/.test(categorySlug)) {
+    page = parseInt(categorySlug, 10)
+    categorySlug = undefined
+  }
+  if (!Number.isInteger(page) || page < 1) page = 1
 
   if (categorySlug) {
     const { data: category } = await supabase
       .from('categories')
-      .select('id, name, slug')
+      .select('slug')
       .eq('slug', categorySlug)
       .single()
 
@@ -97,103 +116,11 @@ bot.command('postcards', async (ctx) => {
         { parse_mode: 'HTML' }
       )
     }
-
-    categoryLabel = category.name
-    query = query.eq('category_id', category.id)
   }
 
-  const { data: cards, error } = await query
-  if (error) return ctx.reply(`❌ DB error: ${error.message}`)
-  if (!cards?.length) {
-    return ctx.reply(
-      categorySlug
-        ? `No cards to post in <b>${categoryLabel}</b>. All active cards in this category have already been posted, or none exist.`
-        : 'No cards to post. All active cards have already been posted, or no cards found.',
-      { parse_mode: 'HTML' }
-    )
-  }
-
-  await ctx.reply(
-    categorySlug
-      ? `📤 Posting ${cards.length} card(s) from <b>${categoryLabel}</b> to the channel...`
-      : `📤 Posting ${cards.length} card(s) to the channel...`,
-    { parse_mode: 'HTML' }
-  )
-
-  let posted = 0
-  let failed = 0
-
-  for (const card of cards) {
-    try {
-      const category = card.category_name ?? card.categories?.name ?? 'Uncategorised'
-      const caption =
-        `🃏 <b>${card.name}</b>\n` +
-        `📂 ${category}\n` +
-        `💰 <b>$${Number(card.price).toFixed(2)}</b>\n` +
-        `📦 Stock: ${card.quantity}\n\n` +
-        `💬 Comment <b>claim</b> or <b>claim [qty]</b> to grab this card!\n` +
-        `↩️ Comment <b>unclaim</b> or <b>unclaim [qty]</b> to release.`
-
-      const { data: existingPost } = await supabase
-        .from('discussion_posts')
-        .select('telegram_message_id')
-        .eq('card_id', card.id)
-        .single()
-
-      if (existingPost) {
-        try {
-          await ctx.telegram.deleteMessage(CHANNEL_ID, existingPost.telegram_message_id)
-        } catch (e) {
-          console.log('could not delete old post:', e.message)
-        }
-        await supabase.from('discussion_posts').delete().eq('card_id', card.id)
-      }
-
-      // Treat empty/whitespace-only URLs as missing
-      const frontImage = card.front_image_url?.trim() || null
-      const backImage  = card.back_image_url?.trim()  || null
-
-      let sentMessage
-
-      if (frontImage && backImage) {
-        try {
-          const mediaGroup = await ctx.telegram.sendMediaGroup(CHANNEL_ID, [
-            { type: 'photo', media: frontImage, caption, parse_mode: 'HTML' },
-            { type: 'photo', media: backImage },
-          ])
-          sentMessage = mediaGroup[0]
-        } catch (e) {
-          // Back image may be broken/unreachable — fall back to front only
-          console.log(`media group failed for card ${card.id}, retrying with front image only:`, e.message)
-          sentMessage = await ctx.telegram.sendPhoto(CHANNEL_ID, frontImage, {
-            caption, parse_mode: 'HTML',
-          })
-        }
-      } else if (frontImage) {
-        sentMessage = await ctx.telegram.sendPhoto(CHANNEL_ID, frontImage, {
-          caption, parse_mode: 'HTML',
-        })
-      } else {
-        sentMessage = await ctx.telegram.sendMessage(CHANNEL_ID, caption, {
-          parse_mode: 'HTML',
-        })
-      }
-
-      await supabase.from('discussion_posts').insert({
-        telegram_message_id: sentMessage.message_id,
-        card_id: card.id,
-      })
-
-      posted++
-      await new Promise(r => setTimeout(r, 1500))
-
-    } catch (err) {
-      console.error(`Failed to post card ${card.id}:`, err.message)
-      failed++
-    }
-  }
-
-  ctx.reply(`✅ Done! Posted: ${posted} card(s)` + (failed ? ` | ❌ Failed: ${failed}` : ''))
+  // Queue the first batch through QStash so the whole posting sequence is
+  // decoupled from the initial Vercel request timeout.
+  await enqueuePostcardsBatch({ categorySlug, page, reportChatId: ctx.chat.id })
 })
 
 // ─── Claim ────────────────────────────────────────────────────────────────────
@@ -213,10 +140,9 @@ bot.hears(/^claim(\s+\d+)?$/i, async (ctx) => {
 
   await upsertUser(ctx.from)
 
-  const post = await getCardByThread(ctx)
-  if (!post) return
+  const card = await getCardFromReply(ctx)
+  if (!card) return
 
-  const { cards: card } = post
   const userId = ctx.from.id
   const name = ctx.from.first_name ?? ctx.from.username ?? 'User'
 
@@ -261,7 +187,7 @@ bot.hears(/^claim(\s+\d+)?$/i, async (ctx) => {
   const qtyMsg = requestedQty > 1 ? ` x${requestedQty}` : ''
 
   ctx.telegram.sendMessage(chatId,
-    `✅ <b>${card.name}</b>${qtyMsg} claimed by ${name}! 🎉${remainingMsg}\nDM @AllThingsTCGClaimsBot with /invoice to checkout your finalised cart!.`,
+    `✅ <b>${card.name}</b>${qtyMsg} claimed by ${name}! 🎉${remainingMsg}\nDM @AllThingsTCGClaimsBot with /invoice to checkout your finalised cart!`,
     { parse_mode: 'HTML', ...replyTo }
   )
 })
@@ -281,10 +207,9 @@ bot.hears(/^unclaim(\s+\d+)?$/i, async (ctx) => {
     return ctx.telegram.sendMessage(chatId, `❌ Quantity must be at least 1.`, replyTo)
   }
 
-  const post = await getCardByThread(ctx)
-  if (!post) return
+  const card = await getCardFromReply(ctx)
+  if (!card) return
 
-  const { cards: card } = post
   const userId = ctx.from.id
 
   const { data: userClaims } = await supabase
@@ -706,31 +631,10 @@ bot.command('claims', async (ctx) => {
 bot.on('message', async (ctx) => {
   const msg = ctx.message
 
-  // 1. Forward listener
+  // Ignore the channel's auto-forwarded posts in the discussion group —
+  // card identity now lives in the post caption, no thread-id tracking needed.
   const fwd = msg?.forward_from_chat
-  if (fwd && fwd.id.toString() === CHANNEL_ID.toString()) {
-    const originalChannelMessageId = msg?.forward_from_message_id
-    const groupThreadMessageId     = msg?.message_id
-
-    if (originalChannelMessageId && groupThreadMessageId) {
-      for (let attempt = 1; attempt <= 5; attempt++) {
-        const { data } = await supabase
-          .from('discussion_posts')
-          .update({ telegram_message_id: groupThreadMessageId })
-          .eq('telegram_message_id', originalChannelMessageId)
-          .select()
-
-        if (data?.length) {
-          console.log(`updated thread id: ${originalChannelMessageId} → ${groupThreadMessageId} (attempt ${attempt})`)
-          return
-        }
-        console.log(`attempt ${attempt}: row not found yet, retrying...`)
-        await new Promise(r => setTimeout(r, 500))
-      }
-      console.log(`failed to update thread id after 5 attempts`)
-    }
-    return
-  }
+  if (fwd && fwd.id.toString() === CHANNEL_ID.toString()) return
 
   if (ctx.chat.type !== 'private') return
 
